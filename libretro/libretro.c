@@ -4,6 +4,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
+
 #include <streams/file_stream.h>
 #include <libretro.h>
 
@@ -25,7 +29,7 @@ static inline int align(int x, int n) {
 #define MB_ALIGN(x) align(x, 20)
 
 int _newlib_vm_size_user = ROM_TRANSLATION_CACHE_SIZE +
-                           RAM_TRANSLATION_CACHE_SIZE; 
+                           RAM_TRANSLATION_CACHE_SIZE;
 
 int getVMBlock();
 
@@ -431,12 +435,106 @@ u32 netplay_num_clients = 0, netplay_client_id = 0;
 static retro_netpacket_send_t netpacket_send_fn_ptr = NULL;
 static retro_netpacket_poll_receive_t netpacket_pollrcv_fn_ptr = NULL;
 
+static void netpacket_dispatch_receive(const void* buf, size_t len, uint16_t client_id) {
+   switch (serial_mode) {
+   case SERIAL_MODE_RFU:
+      rfu_net_receive(buf, len, client_id);
+      break;
+   case SERIAL_MODE_SERIAL_POKE:
+      serialpoke_net_receive(buf, len, client_id);
+      break;
+   case SERIAL_MODE_SERIAL_AW1:
+   case SERIAL_MODE_SERIAL_AW2:
+      serialaw_net_receive(buf, len, client_id);
+      break;
+   };
+}
+
+#ifdef __EMSCRIPTEN__
+EM_JS(int, js_gpsp_bridge_has, (), {
+   return !!(globalThis.__gpspLinkBridge && typeof globalThis.__gpspLinkBridge.send === 'function' && typeof globalThis.__gpspLinkBridge.poll === 'function');
+});
+
+EM_JS(void, js_gpsp_bridge_send, (int dst, const void *data_ptr, int len), {
+   const bridge = globalThis.__gpspLinkBridge;
+   if (!bridge || typeof bridge.send !== 'function') return;
+   if (!len || len <= 0) return;
+   const payload = HEAPU8.slice(data_ptr, data_ptr + len);
+   bridge.send(dst, payload);
+});
+
+EM_JS(int, js_gpsp_bridge_poll, (void *out_ptr, int out_cap, int *src_ptr), {
+   const bridge = globalThis.__gpspLinkBridge;
+   if (!bridge || typeof bridge.poll !== 'function') return 0;
+   const pkt = bridge.poll();
+   if (!pkt || !pkt.data) return 0;
+
+   let data = pkt.data;
+   if (!(data instanceof Uint8Array)) data = new Uint8Array(data);
+
+   const n = Math.min(data.length, out_cap | 0);
+   if (n <= 0) return 0;
+
+   HEAPU8.set(data.subarray(0, n), out_ptr);
+   setValue(src_ptr, (pkt.src | 0) & 0xffff, 'i16');
+   return n;
+});
+
+static uint16_t gpsp_bridge_client_id = 0;
+static uint16_t gpsp_bridge_client_count = 2;
+
+EMSCRIPTEN_KEEPALIVE
+void gpsp_bridge_set_client_id(int client_id) {
+   gpsp_bridge_client_id = (uint16_t)(client_id & 0xffff);
+   netplay_client_id = gpsp_bridge_client_id;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void gpsp_bridge_set_client_count(int client_count) {
+   if (client_count < 2)
+      client_count = 2;
+   if (client_count > 4)
+      client_count = 4;
+   gpsp_bridge_client_count = (uint16_t)client_count;
+   netplay_num_clients = (u32)(gpsp_bridge_client_count - 1);
+}
+
+static void gpsp_bridge_poll_receive() {
+   if (!js_gpsp_bridge_has())
+      return;
+
+   uint8_t buf[2048];
+   int src = 0;
+   int safety = 0;
+
+   while (safety++ < 64) {
+      const int n = js_gpsp_bridge_poll(buf, (int)sizeof(buf), &src);
+      if (n <= 0)
+         break;
+      netpacket_dispatch_receive(buf, (size_t)n, (uint16_t)(src & 0xffff));
+   }
+
+   (void)gpsp_bridge_client_count;
+}
+#endif
+
 void netpacket_poll_receive() {
   if (netpacket_pollrcv_fn_ptr)
     netpacket_pollrcv_fn_ptr();
+
+#ifdef __EMSCRIPTEN__
+   gpsp_bridge_poll_receive();
+#endif
 }
 
 void netpacket_send(uint16_t client_id, const void *buf, size_t len) {
+#ifdef __EMSCRIPTEN__
+   if (js_gpsp_bridge_has()) {
+      js_gpsp_bridge_send((int)client_id, buf, (int)len);
+      return;
+   }
+#endif
+
   // Force all packets to be flushed ASAP, to minimize latency.
   if (netpacket_send_fn_ptr)
     netpacket_send_fn_ptr(RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT, buf, len, client_id);
@@ -445,8 +543,17 @@ void netpacket_send(uint16_t client_id, const void *buf, size_t len) {
 static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_receive_fn) {
   netpacket_send_fn_ptr = send_fn;
   netpacket_pollrcv_fn_ptr = poll_receive_fn;
+#ifdef __EMSCRIPTEN__
+  /* If the gpsp JS bridge already configured client_id/count, don't
+     clobber those values — the bridge setup ran first. */
+  if (!js_gpsp_bridge_has()) {
+    netplay_num_clients = 0;
+    netplay_client_id = client_id;
+  }
+#else
   netplay_num_clients = 0;
   netplay_client_id = client_id;
+#endif
 }
 
 // Netplay session ends.
@@ -456,18 +563,7 @@ static void netpacket_stop() {
 }
 
 static void netpacket_receive(const void* buf, size_t len, uint16_t client_id) {
-  switch (serial_mode) {
-  case SERIAL_MODE_RFU:
-    rfu_net_receive(buf, len, client_id);
-    break;
-  case SERIAL_MODE_SERIAL_POKE:
-    serialpoke_net_receive(buf, len, client_id);
-    break;
-  case SERIAL_MODE_SERIAL_AW1:
-  case SERIAL_MODE_SERIAL_AW2:
-    serialaw_net_receive(buf, len, client_id);
-    break;
-  };
+   netpacket_dispatch_receive(buf, len, client_id);
 }
 
 // Ensure we do not have too many clients for the type of connection used.
@@ -567,7 +663,7 @@ void retro_init(void)
    {
       uint32_t currentHandle;
       check_rosalina();
-      
+
       rom_translation_cache_ptr  = memalign(0x1000, ROM_TRANSLATION_CACHE_SIZE);
       ram_translation_cache_ptr  = memalign(0x1000, RAM_TRANSLATION_CACHE_SIZE);
 
@@ -589,7 +685,7 @@ void retro_init(void)
       void* currentHandle;
 
       sceBlock = getVMBlock();
-      
+
       if (sceBlock < 0)
       {
         return;
@@ -1304,7 +1400,12 @@ void retro_run(void)
      break;
    case SERIAL_MODE_SERIAL_POKE:
      serialpoke_frame_update();
+     netpacket_poll_receive();
      break;
+    case SERIAL_MODE_SERIAL_AW1:
+    case SERIAL_MODE_SERIAL_AW2:
+       netpacket_poll_receive();
+       break;
    };
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
