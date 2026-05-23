@@ -452,11 +452,12 @@ static void netpacket_dispatch_receive(const void* buf, size_t len, uint16_t cli
 
 #ifdef __EMSCRIPTEN__
 EM_JS(int, js_gpsp_bridge_has, (), {
-   return !!(globalThis.__gpspLinkBridge && typeof globalThis.__gpspLinkBridge.send === 'function' && typeof globalThis.__gpspLinkBridge.poll === 'function');
+   const bridge = (typeof Module !== 'undefined' && Module.__gpspLinkBridge) || globalThis.__gpspLinkBridge;
+   return !!(bridge && typeof bridge.send === 'function' && typeof bridge.poll === 'function');
 });
 
 EM_JS(void, js_gpsp_bridge_send, (int dst, const void *data_ptr, int len), {
-   const bridge = globalThis.__gpspLinkBridge;
+   const bridge = (typeof Module !== 'undefined' && Module.__gpspLinkBridge) || globalThis.__gpspLinkBridge;
    if (!bridge || typeof bridge.send !== 'function') return;
    if (!len || len <= 0) return;
    const payload = HEAPU8.slice(data_ptr, data_ptr + len);
@@ -464,7 +465,7 @@ EM_JS(void, js_gpsp_bridge_send, (int dst, const void *data_ptr, int len), {
 });
 
 EM_JS(int, js_gpsp_bridge_poll, (void *out_ptr, int out_cap, int *src_ptr), {
-   const bridge = globalThis.__gpspLinkBridge;
+   const bridge = (typeof Module !== 'undefined' && Module.__gpspLinkBridge) || globalThis.__gpspLinkBridge;
    if (!bridge || typeof bridge.poll !== 'function') return 0;
    const pkt = bridge.poll();
    if (!pkt || !pkt.data) return 0;
@@ -482,6 +483,8 @@ EM_JS(int, js_gpsp_bridge_poll, (void *out_ptr, int out_cap, int *src_ptr), {
 
 static uint16_t gpsp_bridge_client_id = 0;
 static uint16_t gpsp_bridge_client_count = 2;
+static uint32_t gpsp_bridge_sent_packets = 0;
+static uint32_t gpsp_bridge_received_packets = 0;
 
 EMSCRIPTEN_KEEPALIVE
 void gpsp_bridge_set_client_id(int client_id) {
@@ -511,6 +514,7 @@ static void gpsp_bridge_poll_receive() {
       const int n = js_gpsp_bridge_poll(buf, (int)sizeof(buf), &src);
       if (n <= 0)
          break;
+      gpsp_bridge_received_packets++;
       netpacket_dispatch_receive(buf, (size_t)n, (uint16_t)(src & 0xffff));
    }
 
@@ -530,6 +534,7 @@ void netpacket_poll_receive() {
 void netpacket_send(uint16_t client_id, const void *buf, size_t len) {
 #ifdef __EMSCRIPTEN__
    if (js_gpsp_bridge_has()) {
+      gpsp_bridge_sent_packets++;
       js_gpsp_bridge_send((int)client_id, buf, (int)len);
       return;
    }
@@ -589,6 +594,30 @@ static bool netpacket_connected(uint16_t client_id) {
 static void netpacket_disconnected(uint16_t client_id) {
   netplay_num_clients--;
 }
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+uint32_t gpsp_bridge_get_trace_value(int index) {
+   switch (index) {
+   case 0:
+      return (uint32_t)gpsp_bridge_client_id;
+   case 1:
+      return (uint32_t)gpsp_bridge_client_count;
+   case 2:
+      return netplay_client_id;
+   case 3:
+      return netplay_num_clients;
+   case 4:
+      return (uint32_t)serial_mode;
+   case 5:
+      return gpsp_bridge_sent_packets;
+   case 6:
+      return gpsp_bridge_received_packets;
+   default:
+      return 0;
+   }
+}
+#endif
 
 const struct retro_netpacket_callback netpacket_iface = {
   netpacket_start,          /* start */
