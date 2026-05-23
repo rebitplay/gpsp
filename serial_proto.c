@@ -33,12 +33,10 @@
   #define SRPT_DEBUG_LOG(...)
 #endif
 
-/* Always-on lightweight state-transition trace for AW protocol debugging.
-   Uses printf which maps to console.log in Emscripten. */
-#define AW_TRACE(...) printf(__VA_ARGS__)
+#define AW_TRACE(...) SRPT_DEBUG_LOG(__VA_ARGS__)
 
 #define MAX_QPACK             128    // 1 packet per frame (~2 second buffer, maybe too big)
-#define MAX_FPACK             512    // ~2 words per frame (can accumulate up to 256 words per frame)
+#define MAX_FPACK            2048    // AW link packets can burst heavily before sync settles.
 
 
 void netpacket_send(uint16_t client_id, const void *buf, size_t len);
@@ -88,7 +86,6 @@ static union {
       u16 count;                 // Number of queued bytes (full packets
       u8 recvd;                  // Whether we are sending any data
       u8 timeout;                // Number of frames since last heard from.
-      u16 heartbeat_cmd;         // Latest heartbeat command from peer (consumed after one read)
     } peer[4];                   // One of them not used really
 
     u16 lastcmd;
@@ -127,14 +124,8 @@ static union {
 
 
 void serialproto_reset(void) {
-  u32 i;
   SRPT_DEBUG_LOG("Reset serial-proto state\n");
   memset(&serstate, 0, sizeof(serstate));
-  /* CMD_NONE (0x7FFF) signals "no command" — must be set explicitly since
-     memset zeroes everything.  Without this the slave would see a spurious
-     zero command on the first fake IRQ after reset. */
-  for (i = 0; i < 4; i++)
-    serstate.aw.peer[i].heartbeat_cmd = 0x7FFF;
 }
 
 static void serialpoke_senddata(u16 state, const u16 *packet) {
@@ -441,7 +432,7 @@ void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id) {
 #define PSTATE_PACKET_HDR     1
 #define PSTATE_PACKET_BODY    2
 
-#define SLAVE_IRQ_CYCLES_2P   139264   // Aproximately every 8.3ms, twice per frame.
+#define SLAVE_IRQ_CYCLES_PACKET 10484  // 115200bps multi-player transfer timing for four players.
 
 #define CMD_NONE       0x7FFF
 #define CMD_NOP        0x5FFF
@@ -473,6 +464,41 @@ static bool empty_awpeers() {
     if (i != netplay_client_id)
       if (serstate.aw.peer[i].count)
         return false;
+  return true;
+}
+
+static bool serialaw_make_room(u32 client_id, u16 needed) {
+  static int trim_log_count = 0;
+
+  if (needed >= MAX_FPACK)
+    return false;
+
+  while (serstate.aw.peer[client_id].count + needed >= MAX_FPACK) {
+    u16 offset = 0;
+    if (serstate.aw.peer[client_id].recvd) {
+      const u16 active_words = serstate.aw.peer[client_id].data[0] + 1;
+      if (active_words >= serstate.aw.peer[client_id].count)
+        return false;
+      offset = active_words;
+    }
+
+    const u16 queued_words = serstate.aw.peer[client_id].data[offset] + 1;
+    if (queued_words <= 1 || offset + queued_words > serstate.aw.peer[client_id].count) {
+      serstate.aw.peer[client_id].count = 0;
+      serstate.aw.peer[client_id].recvd = 0;
+      return true;
+    }
+
+    memmove(&serstate.aw.peer[client_id].data[offset],
+            &serstate.aw.peer[client_id].data[offset + queued_words],
+            (serstate.aw.peer[client_id].count - offset - queued_words) * sizeof(u16));
+    serstate.aw.peer[client_id].count -= queued_words;
+
+    if (trim_log_count++ < 40)
+      AW_TRACE("[AW-TRIM] from=%d dropped=%d qlen=%d need=%d MAX=%d\n",
+               client_id, queued_words, serstate.aw.peer[client_id].count, needed, MAX_FPACK);
+  }
+
   return true;
 }
 
@@ -519,21 +545,9 @@ static u16 process_awpeer(u32 i) {
     else
       return serstate.aw.peer[i].data[serstate.aw.peer[i].recvd++];
   }
-else {
-      /* Return the latest heartbeat command if available, consuming it so
-         each value is seen exactly once (prevents stale-value corruption).
-         If no heartbeat is pending, fall back to CMD_SYNC when the peer is
-         in SYNC state, or CMD_NONE as the idle default. */
-      u16 hb = serstate.aw.peer[i].heartbeat_cmd;
-      if (hb != CMD_NONE) {
-        serstate.aw.peer[i].heartbeat_cmd = CMD_NONE;  /* consume */
-        return hb;
-      }
-      if (serstate.aw.peer[0].pstate == PSTATE_COMMANDS &&
-          serstate.aw.peer[i].state == STATE_SYNC)
-        return CMD_SYNC;
-      return CMD_NONE;
-    }
+  else
+    return (serstate.aw.peer[0].pstate == PSTATE_COMMANDS &&
+            serstate.aw.peer[i].state == STATE_SYNC) ? CMD_SYNC : CMD_NONE;
 }
 
 void serialaw_master_send(void) {
@@ -669,9 +683,10 @@ bool serialaw_update(unsigned cycles) {
 
   serstate.aw.frcnt += cycles;
 
-  // During sync it's one per frame, otherwise ~2 per frame.
+  // Packet exchange has to drain near the ROM's serial transfer rate.
+  // Sync/intersync stays frame paced because it exchanges readiness/key state.
   const u32 ev_cycles = (serstate.aw.peer[netplay_client_id].state >= STATE_SYNC) ?
-                        SLAVE_IRQ_CYCLES_H : SLAVE_IRQ_CYCLES_2P;
+                        SLAVE_IRQ_CYCLES_H : SLAVE_IRQ_CYCLES_PACKET;
 
   // Raise an IRQ periodically to pretend there's a master.
   if (netplay_client_id && serstate.aw.frcnt > ev_cycles) {
@@ -800,31 +815,13 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
     serstate.aw.peer[client_id].timeout = 0;
     serstate.aw.recv_count++;
 
-    /* When the peer changes state, discard any leftover heartbeat from
-       the previous state — it would confuse the local FSM.  For example
-       a game command cached while in PACKETXG must not leak through
-       after the peer moves to SYNC. */
-    if (ste != serstate.aw.peer[client_id].state)
-      serstate.aw.peer[client_id].heartbeat_cmd = CMD_NONE;
-
     serstate.aw.peer[client_id].state = ste;
-
-    /* For heartbeat packets (cnt=0) store the command so the other side
-       can see it in SIOMULTI on the next transfer / fake-IRQ.  Each value
-       is consumed once by process_awpeer().
-       cmd==0 is a dummy placeholder used in state-notification sends
-       (e.g. serialaw_senddata(0, STATE_SYNC, NULL, 0)) — it must NOT
-       be forwarded or the game would see 0x0000 in SIOMULTI, which it
-       interprets as corrupt data → linking error. */
-    if (cnt == 0 && cmd != 0) {
-      serstate.aw.peer[client_id].heartbeat_cmd = cmd;
-    }
 
     SRPT_DEBUG_LOG("Got packet with state %d cmd %04x and size %d.\n", ste, cmd, cnt);
 
     if (ste == STATE_INTERSYNC) {
       if (cnt >= 2 && len == cnt * 2 + 8) {
-        if (serstate.aw.peer[client_id].count + cnt + 1 < MAX_FPACK) {
+        if (serialaw_make_room(client_id, cnt + 1)) {
           serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count++] = cnt;
           unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], &pkt[2], cnt);
           serstate.aw.peer[client_id].count += cnt;
@@ -835,7 +832,7 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
     }
     else if (ste == STATE_PACKETXG) {
       if (cnt >= 2 && len == cnt * 2 + 8) {
-        if (serstate.aw.peer[client_id].count + cnt + 2 < MAX_FPACK) {
+        if (serialaw_make_room(client_id, cnt + 2)) {
           // We insert this in the queue, adding a header for length.
           // Also the command value (should be 0x4FFF) is inserted too.
           serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count++] = cnt + 1;  // Packet + command
@@ -856,5 +853,3 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
     }
   }
 }
-
-
