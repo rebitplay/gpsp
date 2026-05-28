@@ -473,7 +473,8 @@ EM_JS(int, js_gpsp_bridge_poll, (void *out_ptr, int out_cap, int *src_ptr), {
    let data = pkt.data;
    if (!(data instanceof Uint8Array)) data = new Uint8Array(data);
 
-   const n = Math.min(data.length, out_cap | 0);
+   if (data.length > (out_cap | 0)) return -1;
+   const n = data.length;
    if (n <= 0) return 0;
 
    HEAPU8.set(data.subarray(0, n), out_ptr);
@@ -490,6 +491,8 @@ EMSCRIPTEN_KEEPALIVE
 void gpsp_bridge_set_client_id(int client_id) {
    gpsp_bridge_client_id = (uint16_t)(client_id & 0xffff);
    netplay_client_id = gpsp_bridge_client_id;
+   netplay_num_clients = gpsp_bridge_client_id == 0 ?
+      (u32)(gpsp_bridge_client_count - 1) : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -499,18 +502,19 @@ void gpsp_bridge_set_client_count(int client_count) {
    if (client_count > 4)
       client_count = 4;
    gpsp_bridge_client_count = (uint16_t)client_count;
-   netplay_num_clients = (u32)(gpsp_bridge_client_count - 1);
+   netplay_num_clients = gpsp_bridge_client_id == 0 ?
+      (u32)(gpsp_bridge_client_count - 1) : 0;
 }
 
 static void gpsp_bridge_poll_receive() {
    if (!js_gpsp_bridge_has())
       return;
 
-   uint8_t buf[2048];
+   static uint8_t buf[65536];
    int src = 0;
    int safety = 0;
 
-   while (safety++ < 64) {
+   while (safety++ < 256) {
       const int n = js_gpsp_bridge_poll(buf, (int)sizeof(buf), &src);
       if (n <= 0)
          break;
@@ -613,9 +617,85 @@ uint32_t gpsp_bridge_get_trace_value(int index) {
       return gpsp_bridge_sent_packets;
    case 6:
       return gpsp_bridge_received_packets;
+   case 91:
+      return input_trace_value(0);
+   case 92:
+      return input_trace_value(1);
+   case 93:
+      return input_trace_value(2);
+   case 94:
+      return input_trace_value(3);
+   case 95:
+      return input_trace_value(4);
+   case 96:
+      return input_trace_value(5);
+   case 737:
+      return cpu_ticks;
+   case 738:
+      return frame_counter;
+   case 739:
+      return execute_cycles;
    default:
+      if (index >= 7 && index < 91)
+         return serialaw_trace_value(index - 7);
+      if (index >= 97 && index < 737)
+         return serialaw_trace_value(index - 13);
       return 0;
    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+void gpsp_bridge_receive_packet(int src, const void *data, int len) {
+   if (!data || len <= 0)
+      return;
+
+   gpsp_bridge_received_packets++;
+   netpacket_dispatch_receive(data, (size_t)len, (uint16_t)(src & 0xffff));
+}
+
+EMSCRIPTEN_KEEPALIVE
+int gpsp_bridge_pump_serial(int cycles) {
+   if (cycles < 0)
+      cycles = 0;
+
+   if (update_serial((unsigned)cycles)) {
+      flag_interrupt(IRQ_SERIAL);
+      return 1;
+   }
+
+   return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int gpsp_bridge_step_cpu(int cycles) {
+   if (cycles <= 0)
+      cycles = 4096;
+   if (cycles > 32768)
+      cycles = 32768;
+
+   gpsp_bridge_step_once = 1;
+#ifdef HAVE_DYNAREC
+   if (dynarec_enable)
+      execute_arm_translate((u32)cycles);
+   else
+#endif
+   {
+      clear_gamepak_stickybits();
+      execute_arm((u32)cycles);
+   }
+   gpsp_bridge_step_once = 0;
+
+   return (int)frame_counter;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void gpsp_bridge_set_aw2_raw_bus(int enabled) {
+   serialaw_set_raw_bus_enabled(enabled);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void gpsp_bridge_set_aw2_raw_fast_ack(int enabled) {
+   serialaw_set_raw_fast_ack_enabled(enabled);
 }
 #endif
 
@@ -1329,6 +1409,15 @@ void retro_run(void)
    input_poll_cb();
    update_input();
 
+   switch (serial_mode) {
+   case SERIAL_MODE_RFU:
+   case SERIAL_MODE_SERIAL_POKE:
+   case SERIAL_MODE_SERIAL_AW1:
+   case SERIAL_MODE_SERIAL_AW2:
+      netpacket_poll_receive();
+      break;
+   };
+
    rumble_frame_reset();
 
    /* Check whether current frame should
@@ -1426,6 +1515,7 @@ void retro_run(void)
    switch (serial_mode) {
    case SERIAL_MODE_RFU:
      rfu_frame_update();
+     netpacket_poll_receive();
      break;
    case SERIAL_MODE_SERIAL_POKE:
      serialpoke_frame_update();

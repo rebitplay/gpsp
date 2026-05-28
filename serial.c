@@ -65,10 +65,32 @@ uint16_t serial_mul_siocnt() {
   return ret;
 }
 
+static void serial_mul_update_rcnt(bool active) {
+  u16 rcnt = read_ioreg(REG_RCNT);
+
+  // Mirror the basic multiplayer line state used by other GBA cores:
+  // SI identifies child devices, SD says all devices are ready, and SC
+  // drops while a transfer is active.
+  if (netplay_client_id)
+    rcnt |= 0x04;
+  else
+    rcnt &= ~0x04;
+  rcnt |= 0x02;
+  if (active) {
+    rcnt &= ~0x01;
+    rcnt &= ~0x08;
+  } else {
+    rcnt |= 0x01;
+    rcnt |= 0x08;
+  }
+
+  write_ioreg(REG_RCNT, rcnt);
+}
+
 cpu_alert_type write_rcnt(u16 value) {
   u16 oldval = read_ioreg(REG_RCNT);
-  u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
-  u32 nwmode = get_serial_mode(value, read_ioreg(REG_RCNT));
+  u32 pvmode = get_serial_mode(read_ioreg(REG_SIOCNT), oldval);
+  u32 nwmode = get_serial_mode(read_ioreg(REG_SIOCNT), value);
 
   write_ioreg(REG_RCNT, value);
 
@@ -87,6 +109,7 @@ cpu_alert_type write_rcnt(u16 value) {
 
     // Update SI/SD/ID/Error fields
     write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & 0xFF83) | serial_mul_siocnt());
+    serial_mul_update_rcnt(read_ioreg(REG_SIOCNT) & 0x80);
     break;
 
   case SERIAL_MODE_NORMAL:
@@ -156,20 +179,30 @@ cpu_alert_type write_siocnt(u16 value) {
     if (pvmode != nwmode)
       serialproto_reset();   // Reset multiplayer emulation states.
 
+    if (netplay_client_id)
+      newval = (newval & ~0x0080) | (oldval & 0x0080);
+
     // Update SI/SD/ID/Error fields
     newval = (newval & 0xFF83) | serial_mul_siocnt();
+    serial_mul_update_rcnt(newval & 0x80);
 
     if ((newval & 0x0080) && (!netplay_client_id) && !serial_irq_cycles) {
       // Start a transaction, as a master device (no ongoing transactions).
       const uint16_t tim[] = {
         CLOCK_CYC_9600_16BIT, CLOCK_CYC_38400_16BIT,
         CLOCK_CYC_57600_16BIT, CLOCK_CYC_115200_16BIT };
-      serial_irq_cycles = tim[newval & 0x3] * (netplay_num_clients + 1);
-
-      if (serial_mode == SERIAL_MODE_SERIAL_POKE)
+      if ((serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2) &&
+          serialaw_raw_master_start()) {
+        serial_irq_cycles = 0;
+      }
+      else if (serial_mode == SERIAL_MODE_SERIAL_POKE) {
+        serial_irq_cycles = tim[newval & 0x3] * (netplay_num_clients + 1);
         serialpoke_master_send();
-      else if (serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2)
+      }
+      else if (serial_mode == SERIAL_MODE_SERIAL_AW1 || serial_mode == SERIAL_MODE_SERIAL_AW2) {
+        serial_irq_cycles = tim[newval & 0x3] * (netplay_num_clients + 1);
         serialaw_master_send();
+      }
     }
 
     break;
@@ -183,9 +216,19 @@ cpu_alert_type write_siocnt(u16 value) {
 
 // How many cycles until the next serial event happens. Return MAX otherwise.
 u32 serial_next_event() {
-  if (serial_irq_cycles)
-    return serial_irq_cycles;
-  return ~0U;
+  u32 next = serial_irq_cycles ? serial_irq_cycles : ~0U;
+
+  switch (serial_mode) {
+  case SERIAL_MODE_SERIAL_AW1:
+  case SERIAL_MODE_SERIAL_AW2: {
+    const u32 aw_next = serialaw_next_event();
+    if (aw_next < next)
+      next = aw_next;
+    break;
+  }
+  };
+
+  return next;
 }
 
 // Account for consumed cycles and return if a serial IRQ should be raised.
@@ -230,6 +273,7 @@ bool update_serial(unsigned cycles) {
     case SERIAL_MODE_MULTI:
       // Clear the start bit, signal data is ready.
       write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & ~0x80));
+      serial_mul_update_rcnt(false);
       // Return if IRQs are enabled.
       return read_ioreg(REG_SIOCNT) & 0x4000;
     };
@@ -237,4 +281,3 @@ bool update_serial(unsigned cycles) {
 
   return false;
 }
-

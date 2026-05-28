@@ -940,6 +940,24 @@ cpu_alert_type function_cc write_io_register16(u32 address, u32 value)
     case REG_RCNT:
       return write_rcnt(value);
 
+    case REG_SIOMLT_SEND:
+      write_ioreg(REG_SIOMLT_SEND, value);
+      serialaw_raw_send_write(value);
+      break;
+
+    case REG_SIOMULTI0:
+    case REG_SIOMULTI1:
+      // These addresses are SIODATA32 in Normal32 mode, but receive slots in
+      // Multi-Player mode. Keep Multi-Player slots hardware-owned.
+      if (!(read_ioreg(REG_RCNT) & 0xC000) &&
+          ((read_ioreg(REG_SIOCNT) >> 12) & 0x3) == 1)
+        write_ioreg(ioreg, value);
+      break;
+
+    case REG_SIOMULTI2:
+    case REG_SIOMULTI3:
+      break;
+
     // Interrupt flag, clears the bits it tries to write
     case REG_IF:
       write_ioreg(REG_IF, read_ioreg(REG_IF) & (~value));
@@ -2578,5 +2596,3 @@ s32 load_bios(char *name)
   filestream_close(fd);
   return 0;
 }
-
-

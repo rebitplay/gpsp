@@ -33,10 +33,9 @@
   #define SRPT_DEBUG_LOG(...)
 #endif
 
-#define AW_TRACE(...) SRPT_DEBUG_LOG(__VA_ARGS__)
-
 #define MAX_QPACK             128    // 1 packet per frame (~2 second buffer, maybe too big)
 #define MAX_FPACK            2048    // AW link packets can burst heavily before sync settles.
+#define RAW_TRACE_LEN          64
 
 
 void netpacket_send(uint16_t client_id, const void *buf, size_t len);
@@ -90,9 +89,54 @@ static union {
 
     u16 lastcmd;
     unsigned frcnt;              // Frame counter for events.
-    u32 send_count;              // Total packets sent (diagnostic)
-    u32 recv_count;              // Total packets received (diagnostic)
-    u32 update_count;            // Total serialaw_update calls (diagnostic)
+    struct {
+      u8 enabled;
+      u8 phase;
+      u8 reply_mask;
+      u8 ack_mask;
+      u8 pending_start;
+      u8 irq_pending;
+      u8 request_pending;
+      u8 wait_send_write;
+      u8 ack_pending;
+      u8 transfer_pending;
+      u8 ack_ready;
+      u8 fast_ack;
+      u8 ack_write_count;
+      u32 seq;
+      u32 pending_seq;
+      u32 request_seq;
+      u32 wait_cycles;
+      u32 request_wait_cycles;
+      u32 ack_wait_cycles;
+      u32 timeout_count;
+      u32 send_write_count;
+      u32 fresh_send_count;
+      u32 stale_reply_count;
+      u32 ack_send_count;
+      u32 ack_recv_count;
+      u32 reply_send_count;
+      u32 reply_recv_count;
+      u32 bus_recv_count;
+      u32 last_ack_send_seq;
+      u32 last_drop_seq;
+      u32 trace_count;
+      u8 trace_pos;
+      u16 pending_host_send;
+      u16 reply[4];
+      u16 last_send[4];
+      u16 bus[4];
+      u16 request_words[4];
+      struct {
+        u32 seq;
+        u16 event;
+        u16 extra;
+        u16 words[4];
+        u16 siocnt;
+        u16 rcnt;
+        u16 flags;
+      } trace[RAW_TRACE_LEN];
+    } raw;
   } aw;
 } serstate;
 
@@ -124,8 +168,15 @@ static union {
 
 
 void serialproto_reset(void) {
+  const u8 raw_enabled = serstate.aw.raw.enabled;
+  u8 raw_state[sizeof(serstate.aw.raw)];
+  if (raw_enabled)
+    memcpy(raw_state, &serstate.aw.raw, sizeof(raw_state));
+
   SRPT_DEBUG_LOG("Reset serial-proto state\n");
   memset(&serstate, 0, sizeof(serstate));
+  if (raw_enabled)
+    memcpy(&serstate.aw.raw, raw_state, sizeof(raw_state));
 }
 
 static void serialpoke_senddata(u16 state, const u16 *packet) {
@@ -185,15 +236,6 @@ void serialpoke_master_send(void) {
       if (++serstate.poke.hscnt > SEQ_HANDSHAKE_TOKENS) {
         SRPT_DEBUG_LOG("Detected handshake, switching state!\n");
         serstate.poke.peer[0].state = STATE_HANDSHAKE;
-        serstate.poke.offset = 0;
-        serstate.poke.checksum = 0;
-        serstate.poke.hscnt = 0;
-        // Write handshake values to peer slots so game sees correct data
-        for (i = 1; i <= 3; i++)
-          write_ioreg(REG_SIOMULTI0 + i,
-            serstate.poke.peer[i].state == STATE_HANDSHAKE ? SLAVE_HANDSHAKE : 0xFFFF);
-        // Notify peer immediately about state change
-        serialpoke_senddata(serstate.poke.peer[0].state, NULL);
         return;
       }
     }
@@ -260,11 +302,6 @@ void serialpoke_frame_update(void) {
 
 bool serialpoke_update(unsigned cycles) {
   u32 i;
-
-  // Poll network/bridge packets on each update tick so incoming
-  // state/data packets are available with minimum delay.
-  netpacket_poll_receive();
-
   serstate.poke.frcnt += cycles;
 
   // During handshake we tipically receive one serial transaction per frame.
@@ -328,12 +365,7 @@ bool serialpoke_update(unsigned cycles) {
           if (++serstate.poke.hscnt > SEQ_HANDSHAKE_TOKENS) {
             SRPT_DEBUG_LOG("Detected handshake, switching state!\n");
             serstate.poke.peer[netplay_client_id].state = STATE_HANDSHAKE;
-            serstate.poke.offset = 0;
-            serstate.poke.checksum = 0;
-            serstate.poke.hscnt = 0;
-            // Notify peer immediately about state change
-            serialpoke_senddata(serstate.poke.peer[netplay_client_id].state, NULL);
-            return true;  // Fire IRQ so game processes state change
+            return false;
           }
         }
 
@@ -440,6 +472,469 @@ void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id) {
 #define CMD_SYNC       (serial_mode == SERIAL_MODE_SERIAL_AW1 ? 0x5678 : 0x9ABC)
 #define PACK_TAIL_SZ   (serial_mode == SERIAL_MODE_SERIAL_AW1 ? 1 : 2)
 
+#define NET_SERAWRW_HEADER          0x52415732   // RAW2
+#define RAW_KIND_REQ                1
+#define RAW_KIND_REPLY              2
+#define RAW_KIND_BUS                3
+#define RAW_KIND_ACK                4
+#define RAW_TRACE_REQ_TX            1
+#define RAW_TRACE_REQ_RX            2
+#define RAW_TRACE_REPLY_TX          3
+#define RAW_TRACE_REPLY_RX          4
+#define RAW_TRACE_BUS_TX            5
+#define RAW_TRACE_BUS_RX            6
+#define RAW_TRACE_IRQ               7
+#define RAW_TRACE_ACK_TX            8
+#define RAW_TRACE_ACK_RX            9
+#define RAW_TRACE_STALE            10
+#define RAW_TRACE_SEND_WRITE       11
+#define RAW_PHASE_IDLE              0
+#define RAW_PHASE_WAIT_REPLIES      1
+#define RAW_PHASE_WAIT_ACKS         2
+#define RAW_TIMEOUT_CYCLES          33707520     // About two seconds; avoid fabricating partial link transfers.
+#define RAW_READY_TIMEOUT_CYCLES    (280896 * 12) // Give guests time to publish post-IRQ send words before falling back to stale data.
+#define RAW_ACK_QUIET_CYCLES        1 // Let same-burst post-IRQ send-word writes settle without a frame-scale delay.
+#define RAW_POLL_CYCLES             4096
+
+static u32 raw_transfer_cycles(void) {
+  static const u32 per_word_cycles[4] = { 31457, 7864, 5242, 2621 };
+  const u32 clients = netplay_num_clients ? netplay_num_clients : 3;
+  const u32 slaves = clients < 1 ? 1 : (clients > 3 ? 3 : clients);
+  return per_word_cycles[read_ioreg(REG_SIOCNT) & 0x3] * (slaves + 1);
+}
+
+static u8 raw_expected_mask(void) {
+  u8 mask = 1;
+  u32 i;
+  const u32 clients = netplay_num_clients ? netplay_num_clients : 3;
+  for (i = 1; i <= clients && i <= 3; i++)
+    mask |= (u8)(1 << i);
+  return mask;
+}
+
+static u16 raw_mul_siocnt_status(void) {
+  return (u16)(0x08 | ((netplay_client_id & 3) << 4) |
+               (netplay_client_id ? 0x04 : 0));
+}
+
+static void raw_write_transfer_lines(u16 value) {
+  value &= 0xff4b;
+  value |= 0x80;
+  value |= raw_mul_siocnt_status();
+  write_ioreg(REG_SIOCNT, value);
+  write_ioreg(REG_RCNT, netplay_client_id ? 6 : 2);
+}
+
+static void raw_write_complete_lines(void) {
+  u16 value = read_ioreg(REG_SIOCNT);
+  value = (value & 0xff03) | raw_mul_siocnt_status();
+  write_ioreg(REG_SIOCNT, value);
+  write_ioreg(REG_RCNT, netplay_client_id ? 0x0f : 0x0b);
+}
+
+static void raw_pack_words(u32 *pkt, const u16 *words) {
+  pkt[3] = netorder32(((u32)words[0] << 16) | words[1]);
+  pkt[4] = netorder32(((u32)words[2] << 16) | words[3]);
+}
+
+static void raw_unpack_words(u16 *words, const u32 *pkt) {
+  const u32 a = netorder32(pkt[3]);
+  const u32 b = netorder32(pkt[4]);
+  words[0] = a >> 16;
+  words[1] = a & 0xffff;
+  words[2] = b >> 16;
+  words[3] = b & 0xffff;
+}
+
+static void raw_trace(u16 event, u32 seq, const u16 *words, u16 extra) {
+  u32 i;
+  const u32 pos = serstate.aw.raw.trace_pos % RAW_TRACE_LEN;
+  const u16 flags = (u16)((serstate.aw.raw.phase << 12) |
+                          (serstate.aw.raw.reply_mask << 8) |
+                          (serstate.aw.raw.ack_mask << 4) |
+                          (serstate.aw.raw.irq_pending ? 0x0001 : 0) |
+                          (serstate.aw.raw.request_pending ? 0x0002 : 0) |
+                          (serstate.aw.raw.wait_send_write ? 0x0004 : 0) |
+                          (serstate.aw.raw.ack_pending ? 0x0008 : 0));
+
+  serstate.aw.raw.trace[pos].seq = seq;
+  serstate.aw.raw.trace[pos].event = event;
+  serstate.aw.raw.trace[pos].extra = extra;
+  for (i = 0; i <= 3; i++)
+    serstate.aw.raw.trace[pos].words[i] = words ? words[i] : 0;
+  serstate.aw.raw.trace[pos].siocnt = read_ioreg(REG_SIOCNT);
+  serstate.aw.raw.trace[pos].rcnt = read_ioreg(REG_RCNT);
+  serstate.aw.raw.trace[pos].flags = flags;
+
+  serstate.aw.raw.trace_pos = (pos + 1) % RAW_TRACE_LEN;
+  serstate.aw.raw.trace_count++;
+}
+
+static void raw_send(u8 kind, u32 seq, const u16 *words, uint16_t target) {
+  u32 pkt[5] = {
+    netorder32(NET_SERAWRW_HEADER),
+    netorder32(kind),
+    netorder32(seq),
+    0,
+    0,
+  };
+  raw_pack_words(pkt, words);
+  netpacket_send(target, pkt, sizeof(pkt));
+}
+
+static void raw_send_ack(u32 seq) {
+  const u16 words[4] = { 0, 0, 0, 0 };
+  serstate.aw.raw.ack_send_count++;
+  serstate.aw.raw.last_ack_send_seq = seq;
+  raw_trace(RAW_TRACE_ACK_TX, seq, words, 0);
+  raw_send(RAW_KIND_ACK, seq, words, 0);
+}
+
+static void raw_reply_to_pending_request(void);
+
+static void raw_finish_deferred_ack(void) {
+  raw_send_ack(serstate.aw.raw.pending_seq);
+  serstate.aw.raw.ack_pending = 0;
+  serstate.aw.raw.ack_ready = 0;
+  serstate.aw.raw.ack_write_count = 0;
+  serstate.aw.raw.ack_wait_cycles = 0;
+  serstate.aw.raw.wait_send_write = 0;
+  serstate.aw.raw.request_wait_cycles = 0;
+
+  if (serstate.aw.raw.request_pending)
+    raw_reply_to_pending_request();
+}
+
+static bool raw_client_prepare_seq(u32 seq) {
+  if (serstate.aw.raw.pending_seq && seq < serstate.aw.raw.pending_seq)
+    return false;
+
+  if (seq != serstate.aw.raw.pending_seq) {
+    serstate.aw.raw.pending_seq = seq;
+    serstate.aw.raw.reply_mask = 0;
+    memset(serstate.aw.raw.reply, 0, sizeof(serstate.aw.raw.reply));
+  }
+
+  return true;
+}
+
+static void raw_reply_to_pending_request(void) {
+  u16 words[4];
+  const u8 local_mask = (u8)(1 << (netplay_client_id & 3));
+
+  serstate.aw.raw.request_words[netplay_client_id] = read_ioreg(REG_SIOMLT_SEND);
+  memcpy(words, serstate.aw.raw.request_words, sizeof(words));
+  serstate.aw.raw.reply[0] = words[0];
+  serstate.aw.raw.reply[netplay_client_id] = words[netplay_client_id];
+  serstate.aw.raw.reply_mask |= (u8)(1 | local_mask);
+  serstate.aw.raw.last_send[0] = words[0];
+  serstate.aw.raw.last_send[netplay_client_id] = words[netplay_client_id];
+  serstate.aw.raw.reply_send_count++;
+  raw_trace(RAW_TRACE_REPLY_TX, serstate.aw.raw.request_seq, words, words[netplay_client_id]);
+  raw_send(RAW_KIND_REPLY, serstate.aw.raw.request_seq, words, 0);
+  serstate.aw.raw.request_pending = 0;
+  serstate.aw.raw.request_wait_cycles = 0;
+}
+
+static void raw_receive_request(u32 seq, const u16 *words) {
+  u32 i;
+
+  if (!raw_client_prepare_seq(seq))
+    return;
+
+  raw_write_transfer_lines(read_ioreg(REG_SIOCNT));
+  for (i = 0; i <= 3; i++)
+    write_ioreg(REG_SIOMULTI0 + i, 0xffff);
+  raw_trace(RAW_TRACE_REQ_RX, seq, words, read_ioreg(REG_SIOMLT_SEND));
+  memcpy(serstate.aw.raw.request_words, words, sizeof(serstate.aw.raw.request_words));
+  serstate.aw.raw.request_words[netplay_client_id] = read_ioreg(REG_SIOMLT_SEND);
+  serstate.aw.raw.request_seq = seq;
+  serstate.aw.raw.reply[0] = words[0];
+  serstate.aw.raw.reply_mask |= 1;
+  serstate.aw.raw.transfer_pending = 1;
+  serstate.aw.raw.wait_cycles = 0;
+  serstate.aw.raw.request_wait_cycles = 0;
+
+  serstate.aw.raw.request_pending = 1;
+  raw_reply_to_pending_request();
+}
+
+static void raw_begin_request(u16 host_send) {
+  u16 words[4] = { host_send, 0, 0, 0 };
+  u32 i;
+
+  raw_write_transfer_lines(read_ioreg(REG_SIOCNT));
+  for (i = 0; i <= 3; i++)
+    write_ioreg(REG_SIOMULTI0 + i, 0xffff);
+  serstate.aw.raw.phase = RAW_PHASE_WAIT_REPLIES;
+  serstate.aw.raw.pending_seq = ++serstate.aw.raw.seq;
+  serstate.aw.raw.reply_mask = 1;
+  serstate.aw.raw.ack_mask = 1;
+  serstate.aw.raw.wait_cycles = 0;
+  serstate.aw.raw.reply[0] = host_send;
+  serstate.aw.raw.last_send[0] = host_send;
+  raw_trace(RAW_TRACE_REQ_TX, serstate.aw.raw.pending_seq, words, host_send);
+  raw_send(RAW_KIND_REQ, serstate.aw.raw.pending_seq, words, RETRO_NETPACKET_BROADCAST);
+}
+
+static bool raw_host_finish_acks_if_ready(void) {
+  const u8 expected = raw_expected_mask();
+  u32 i;
+
+  if (netplay_client_id ||
+      serstate.aw.raw.phase != RAW_PHASE_WAIT_ACKS ||
+      (serstate.aw.raw.ack_mask & expected) != expected)
+    return false;
+
+  serstate.aw.raw.wait_cycles = 0;
+  for (i = 0; i <= 3; i++)
+    write_ioreg(REG_SIOMULTI0 + i, serstate.aw.raw.bus[i]);
+
+  raw_write_complete_lines();
+  raw_trace(RAW_TRACE_IRQ, serstate.aw.raw.pending_seq, serstate.aw.raw.bus,
+            ((u16)serstate.aw.raw.reply_mask << 8) | serstate.aw.raw.ack_mask);
+
+  if (serstate.aw.raw.pending_start) {
+    serstate.aw.raw.pending_start = 0;
+    raw_begin_request(serstate.aw.raw.pending_host_send);
+  } else {
+    serstate.aw.raw.phase = RAW_PHASE_IDLE;
+  }
+  return read_ioreg(REG_SIOCNT) & 0x4000;
+}
+
+bool serialaw_raw_master_start(void) {
+  if (!serstate.aw.raw.enabled || netplay_client_id)
+    return false;
+
+  if (serstate.aw.raw.phase != RAW_PHASE_IDLE) {
+    if (serstate.aw.raw.phase == RAW_PHASE_WAIT_ACKS &&
+        !serstate.aw.raw.pending_start) {
+      serstate.aw.raw.pending_host_send = read_ioreg(REG_SIOMLT_SEND);
+      serstate.aw.raw.pending_start = 1;
+    }
+    return true;
+  }
+
+  serstate.aw.raw.pending_host_send = read_ioreg(REG_SIOMLT_SEND);
+  serstate.aw.raw.pending_start = 0;
+  raw_begin_request(serstate.aw.raw.pending_host_send);
+  return true;
+}
+
+void serialaw_raw_send_write(u16 value) {
+  if (!serstate.aw.raw.enabled)
+    return;
+
+  serstate.aw.raw.last_send[netplay_client_id & 3] = value;
+  if (netplay_client_id && serstate.aw.raw.request_pending)
+    serstate.aw.raw.request_words[netplay_client_id & 3] = value;
+  serstate.aw.raw.send_write_count++;
+  raw_trace(RAW_TRACE_SEND_WRITE, serstate.aw.raw.pending_seq, serstate.aw.raw.last_send, value);
+
+  if (netplay_client_id && serstate.aw.raw.ack_pending) {
+    serstate.aw.raw.ack_write_count++;
+    serstate.aw.raw.ack_ready = 1;
+    serstate.aw.raw.wait_send_write = 0;
+    serstate.aw.raw.fresh_send_count++;
+    serstate.aw.raw.ack_wait_cycles = 0;
+    return;
+  }
+
+  if (netplay_client_id && serstate.aw.raw.wait_send_write) {
+    serstate.aw.raw.wait_send_write = 0;
+    serstate.aw.raw.fresh_send_count++;
+    if (serstate.aw.raw.request_pending)
+      raw_reply_to_pending_request();
+    else
+      serstate.aw.raw.request_wait_cycles = 0;
+  }
+}
+
+static bool raw_complete_master_transfer(void) {
+  u32 i;
+  for (i = 0; i <= 3; i++) {
+    u16 value = (serstate.aw.raw.reply_mask & (1 << i)) ?
+      serstate.aw.raw.reply[i] : serstate.aw.raw.last_send[i];
+
+    serstate.aw.raw.bus[i] = value;
+    serstate.aw.raw.last_send[i] = value;
+  }
+
+  raw_trace(RAW_TRACE_BUS_TX, serstate.aw.raw.pending_seq, serstate.aw.raw.bus,
+            ((u16)serstate.aw.raw.reply_mask << 8) | serstate.aw.raw.ack_mask);
+
+  serstate.aw.raw.phase = RAW_PHASE_WAIT_ACKS;
+  serstate.aw.raw.ack_mask = 1;
+  serstate.aw.raw.wait_cycles = 0;
+  raw_send(RAW_KIND_BUS, serstate.aw.raw.pending_seq, serstate.aw.raw.bus,
+           RETRO_NETPACKET_BROADCAST);
+  return false;
+}
+
+static bool raw_complete_client_transfer(void) {
+  u32 i;
+
+  for (i = 0; i <= 3; i++) {
+    u16 value = (serstate.aw.raw.reply_mask & (1 << i)) ?
+      serstate.aw.raw.reply[i] : serstate.aw.raw.last_send[i];
+
+    serstate.aw.raw.bus[i] = value;
+    serstate.aw.raw.last_send[i] = value;
+    write_ioreg(REG_SIOMULTI0 + i, value);
+  }
+
+  serstate.aw.raw.irq_pending = 0;
+  serstate.aw.raw.transfer_pending = 0;
+  serstate.aw.raw.wait_cycles = 0;
+  serstate.aw.raw.wait_send_write = 1;
+  serstate.aw.raw.ack_pending = 1;
+  serstate.aw.raw.ack_ready = 0;
+  serstate.aw.raw.ack_write_count = 0;
+  serstate.aw.raw.ack_wait_cycles = 0;
+  serstate.aw.raw.request_wait_cycles = 0;
+  raw_write_complete_lines();
+  raw_trace(RAW_TRACE_IRQ, serstate.aw.raw.pending_seq, serstate.aw.raw.bus, read_ioreg(REG_SIOMLT_SEND));
+  return read_ioreg(REG_SIOCNT) & 0x4000;
+}
+
+static bool raw_update(unsigned cycles) {
+  netpacket_poll_receive();
+
+  if (!netplay_client_id) {
+    const u8 expected = raw_expected_mask();
+
+    if (serstate.aw.raw.phase == RAW_PHASE_WAIT_REPLIES) {
+      serstate.aw.raw.wait_cycles += cycles;
+      if ((serstate.aw.raw.reply_mask & expected) == expected &&
+          serstate.aw.raw.wait_cycles >= raw_transfer_cycles())
+        return raw_complete_master_transfer();
+
+      if (serstate.aw.raw.wait_cycles >= RAW_TIMEOUT_CYCLES) {
+        serstate.aw.raw.timeout_count++;
+        serstate.aw.raw.wait_cycles = 0;
+      }
+    }
+    else if (serstate.aw.raw.phase == RAW_PHASE_WAIT_ACKS) {
+      serstate.aw.raw.wait_cycles += cycles;
+      if (raw_host_finish_acks_if_ready())
+        return true;
+      if (serstate.aw.raw.phase == RAW_PHASE_WAIT_ACKS &&
+          serstate.aw.raw.wait_cycles >= RAW_TIMEOUT_CYCLES) {
+        serstate.aw.raw.timeout_count++;
+        serstate.aw.raw.wait_cycles = 0;
+      }
+    }
+
+    return false;
+  }
+
+  if (serstate.aw.raw.wait_send_write && serstate.aw.raw.request_pending) {
+    serstate.aw.raw.request_wait_cycles += cycles;
+    if (serstate.aw.raw.request_wait_cycles >= RAW_READY_TIMEOUT_CYCLES) {
+      serstate.aw.raw.timeout_count++;
+      serstate.aw.raw.stale_reply_count++;
+      serstate.aw.raw.wait_send_write = 0;
+      raw_trace(RAW_TRACE_STALE, serstate.aw.raw.request_pending ?
+        serstate.aw.raw.request_seq : serstate.aw.raw.pending_seq,
+        serstate.aw.raw.request_pending ? serstate.aw.raw.request_words : serstate.aw.raw.bus,
+        read_ioreg(REG_SIOMLT_SEND));
+      if (serstate.aw.raw.request_pending)
+        raw_reply_to_pending_request();
+      else
+        serstate.aw.raw.request_wait_cycles = 0;
+    }
+  }
+
+  if (serstate.aw.raw.ack_pending) {
+    serstate.aw.raw.ack_wait_cycles += cycles;
+    if (serstate.aw.raw.ack_ready) {
+      if (serstate.aw.raw.ack_wait_cycles >= RAW_ACK_QUIET_CYCLES)
+        raw_finish_deferred_ack();
+    }
+    else if (serstate.aw.raw.ack_wait_cycles >= RAW_READY_TIMEOUT_CYCLES) {
+      serstate.aw.raw.timeout_count++;
+      serstate.aw.raw.stale_reply_count++;
+      raw_trace(RAW_TRACE_STALE, serstate.aw.raw.pending_seq,
+                serstate.aw.raw.bus, read_ioreg(REG_SIOMLT_SEND));
+      raw_finish_deferred_ack();
+    }
+  }
+
+  if (serstate.aw.raw.request_pending &&
+      !serstate.aw.raw.wait_send_write &&
+      !serstate.aw.raw.ack_pending) {
+    serstate.aw.raw.request_wait_cycles += cycles;
+    if (serstate.aw.raw.request_wait_cycles >= RAW_POLL_CYCLES)
+      raw_reply_to_pending_request();
+  }
+
+  if (serstate.aw.raw.transfer_pending &&
+      serstate.aw.raw.wait_cycles < RAW_TIMEOUT_CYCLES)
+    serstate.aw.raw.wait_cycles += cycles;
+
+  if (serstate.aw.raw.irq_pending) {
+    if (serstate.aw.raw.transfer_pending &&
+        serstate.aw.raw.wait_cycles < raw_transfer_cycles())
+      return false;
+
+    return raw_complete_client_transfer();
+  }
+
+  return false;
+}
+
+u32 serialaw_next_event(void) {
+  if (!serstate.aw.raw.enabled)
+    return ~0U;
+
+  if (!netplay_client_id) {
+    const u8 expected = raw_expected_mask();
+
+    if (serstate.aw.raw.phase == RAW_PHASE_WAIT_REPLIES) {
+      if ((serstate.aw.raw.reply_mask & expected) == expected) {
+        const u32 transfer_cycles = raw_transfer_cycles();
+        if (serstate.aw.raw.wait_cycles >= transfer_cycles)
+          return 1;
+        return transfer_cycles - serstate.aw.raw.wait_cycles;
+      }
+      return RAW_POLL_CYCLES;
+    }
+
+    if (serstate.aw.raw.phase == RAW_PHASE_WAIT_ACKS)
+      return ((serstate.aw.raw.ack_mask & expected) == expected) ? 1 : RAW_POLL_CYCLES;
+
+    return ~0U;
+  }
+
+  if (serstate.aw.raw.irq_pending) {
+    if (serstate.aw.raw.transfer_pending) {
+      const u32 transfer_cycles = raw_transfer_cycles();
+      if (serstate.aw.raw.wait_cycles < transfer_cycles)
+        return transfer_cycles - serstate.aw.raw.wait_cycles;
+    }
+    return 1;
+  }
+
+  if (serstate.aw.raw.transfer_pending) {
+    return RAW_POLL_CYCLES;
+  }
+
+  if (serstate.aw.raw.wait_send_write && serstate.aw.raw.request_pending)
+    return RAW_POLL_CYCLES;
+
+  if (serstate.aw.raw.ack_pending) {
+    if (serstate.aw.raw.ack_ready) {
+      if (serstate.aw.raw.ack_wait_cycles >= RAW_ACK_QUIET_CYCLES)
+        return 1;
+      return RAW_ACK_QUIET_CYCLES - serstate.aw.raw.ack_wait_cycles;
+    }
+    return RAW_POLL_CYCLES;
+  }
+
+  return ~0U;
+}
+
 static void serialaw_senddata(u16 cmd, u8 state, const u16 *packet, size_t wcnt) {
   u32 flags = (cmd << 16) | (state << 8) | wcnt;
   u32 pkt[2 + 128] = {
@@ -448,13 +943,6 @@ static void serialaw_senddata(u16 cmd, u8 state, const u16 *packet, size_t wcnt)
   };
   pack16(&pkt[2], packet, wcnt);
 
-  serstate.aw.send_count++;
-  if (wcnt > 0) {
-    static int aw_data_send_count = 0;
-    if (aw_data_send_count++ < 20)
-      AW_TRACE("[AW-DATA-TX] cmd=%04x st=%d cnt=%zu myid=%d\n",
-               cmd, state, wcnt, netplay_client_id);
-  }
   netpacket_send(RETRO_NETPACKET_BROADCAST, pkt, 8 + wcnt * 2);
 }
 
@@ -468,8 +956,6 @@ static bool empty_awpeers() {
 }
 
 static bool serialaw_make_room(u32 client_id, u16 needed) {
-  static int trim_log_count = 0;
-
   if (needed >= MAX_FPACK)
     return false;
 
@@ -493,10 +979,6 @@ static bool serialaw_make_room(u32 client_id, u16 needed) {
             &serstate.aw.peer[client_id].data[offset + queued_words],
             (serstate.aw.peer[client_id].count - offset - queued_words) * sizeof(u16));
     serstate.aw.peer[client_id].count -= queued_words;
-
-    if (trim_log_count++ < 40)
-      AW_TRACE("[AW-TRIM] from=%d dropped=%d qlen=%d need=%d MAX=%d\n",
-               client_id, queued_words, serstate.aw.peer[client_id].count, needed, MAX_FPACK);
   }
 
   return true;
@@ -557,9 +1039,6 @@ void serialaw_master_send(void) {
   write_ioreg(REG_SIOMULTI0, mvalue);   // echo sent value
 
   if (serstate.aw.peer[0].state == STATE_SYNC) {
-    static int aw_sync_log_count = 0;
-    if (aw_sync_log_count++ < 10)
-      AW_TRACE("[AW-MASTER] SYNC mval=%04x peer1.st=%d\n", mvalue, serstate.aw.peer[1].state);
     if (mvalue == CMD_NONE)
       serstate.aw.peer[0].state = STATE_PACKETXG;
     else {
@@ -568,7 +1047,6 @@ void serialaw_master_send(void) {
         write_ioreg(REG_SIOMULTI0 + i, serstate.aw.peer[i].state >= STATE_SYNC ? CMD_SYNC : CMD_NONE);
 
       if (mvalue != CMD_SYNC && mvalue != CMD_NOP) {
-        AW_TRACE("[AW-MASTER] SYNC->INTERSYNC mval=%04x\n", mvalue);
         serstate.aw.peer[0].state = STATE_INTERSYNC;
         serstate.aw.peer[0].count = 0;
         SRPT_DEBUG_LOG("Changing to INTERSYNC state\n");
@@ -600,18 +1078,10 @@ void serialaw_master_send(void) {
         serstate.aw.peer[0].pstate = PSTATE_PACKET_HDR;
       else if (mvalue == CMD_SYNC && empty_awpeers()) {
         serstate.aw.peer[0].state = STATE_SYNC;
-        AW_TRACE("[AW-MASTER] -> STATE_SYNC (cmd=%04x ncl=%d)\n", mvalue, netplay_num_clients);
         SRPT_DEBUG_LOG("Moving to SYNC state\n");
-        /* Immediately notify peers so the slave can see STATE_SYNC
-           without waiting for the next master transfer. */
         serialaw_senddata(mvalue, STATE_SYNC, NULL, 0);
       }
       else if (mvalue == CMD_SYNC) {
-        /* CMD_SYNC but peers not empty — can't transition. Log it. */
-        static int sync_blocked_count = 0;
-        if (sync_blocked_count++ < 10)
-          AW_TRACE("[AW-MASTER] CMD_SYNC blocked: q1=%d q2=%d q3=%d\n",
-                   serstate.aw.peer[1].count, serstate.aw.peer[2].count, serstate.aw.peer[3].count);
         serialaw_senddata(mvalue, STATE_PACKETXG, NULL, 0);
       }
       else {
@@ -653,32 +1123,9 @@ void serialaw_master_send(void) {
 bool serialaw_update(unsigned cycles) {
   u32 i;
 
-  static int aw_update_first = 1;
-  if (aw_update_first) {
-    aw_update_first = 0;
-    AW_TRACE("[AW-INIT] serialaw_update first call, client_id=%d num_clients=%d serial_mode=%d\n",
-             netplay_client_id, netplay_num_clients, serial_mode);
-  }
+  if (serstate.aw.raw.enabled)
+    return raw_update(cycles);
 
-  serstate.aw.update_count++;
-  /* Periodic summary every ~2 seconds (assuming ~120 calls/s for slave, fewer for master) */
-  if ((serstate.aw.update_count & 0xFF) == 0) {
-    AW_TRACE("[AW-STAT] upd=%u tx=%u rx=%u myid=%d st=%d pst=%d "
-             "peer0.st=%d peer1.st=%d q0=%d q1=%d "
-             "SIO=%04x,%04x,%04x,%04x CNT=%04x\n",
-             serstate.aw.update_count, serstate.aw.send_count, serstate.aw.recv_count,
-             netplay_client_id,
-             serstate.aw.peer[netplay_client_id].state,
-             serstate.aw.peer[netplay_client_id].pstate,
-             serstate.aw.peer[0].state, serstate.aw.peer[1].state,
-             serstate.aw.peer[0].count, serstate.aw.peer[1].count,
-             read_ioreg(REG_SIOMULTI0), read_ioreg(REG_SIOMULTI1),
-             read_ioreg(REG_SIOMULTI2), read_ioreg(REG_SIOMULTI3),
-             read_ioreg(REG_SIOCNT));
-  }
-
-  // AW link mode is very timing sensitive. Poll network/bridge packets
-  // on each update tick so incoming words are available with minimum delay.
   netpacket_poll_receive();
 
   serstate.aw.frcnt += cycles;
@@ -745,9 +1192,7 @@ bool serialaw_update(unsigned cycles) {
           serstate.aw.peer[netplay_client_id].pstate = PSTATE_PACKET_HDR;
         else if (mdata == CMD_SYNC && empty_awpeers()) {
           serstate.aw.peer[netplay_client_id].state = STATE_SYNC;
-          AW_TRACE("[AW-SLAVE] -> STATE_SYNC (cmd=%04x ncl=%d)\n", mdata, netplay_num_clients);
           SRPT_DEBUG_LOG("Moving to SYNC state\n");
-          /* Immediately notify peers about the SYNC transition. */
           serialaw_senddata(mdata, STATE_SYNC, NULL, 0);
         }
         else {
@@ -786,11 +1231,7 @@ bool serialaw_update(unsigned cycles) {
       read_ioreg(REG_SIOMULTI0), read_ioreg(REG_SIOMULTI1),
       read_ioreg(REG_SIOMULTI2), read_ioreg(REG_SIOMULTI3));
 
-    /* Clear the start/busy bit in SIOCNT, just like real GBA hardware does
-     * when a multiplayer transfer completes.  Without this the game may
-     * think the transfer is still in progress and refuse to process the
-     * received SIOMULTI data. */
-    write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & ~0x80));
+    write_ioreg(REG_SIOCNT, read_ioreg(REG_SIOCNT) & ~0x80);
 
     return true;
   }
@@ -799,22 +1240,83 @@ bool serialaw_update(unsigned cycles) {
 }
 
 void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
-  // MAW1 header, sanity checking.
   const u32 *pkt = (u32*)buf;
+  u16 words[4] = { 0, 0, 0, 0 };
+
+  if (serstate.aw.raw.enabled && len == 20 && netorder32(pkt[0]) == NET_SERAWRW_HEADER) {
+    const u32 kind = netorder32(pkt[1]);
+    const u32 seq = netorder32(pkt[2]);
+    raw_unpack_words(words, pkt);
+
+    if (kind == RAW_KIND_REQ && netplay_client_id && client_id == 0) {
+      raw_receive_request(seq, words);
+    }
+    else if (kind == RAW_KIND_REPLY && !netplay_client_id && client_id <= 3 &&
+             serstate.aw.raw.phase == RAW_PHASE_WAIT_REPLIES &&
+             seq == serstate.aw.raw.pending_seq) {
+      serstate.aw.raw.reply[client_id] = words[client_id];
+      serstate.aw.raw.last_send[client_id] = words[client_id];
+      serstate.aw.raw.reply_mask |= (u8)(1 << client_id);
+      if ((serstate.aw.raw.reply_mask & raw_expected_mask()) == raw_expected_mask())
+        serstate.aw.raw.wait_cycles = 0;
+      serstate.aw.raw.reply_recv_count++;
+      raw_trace(RAW_TRACE_REPLY_RX, seq, words, client_id);
+    }
+    else if (kind == RAW_KIND_REPLY && netplay_client_id && client_id <= 3 &&
+             client_id != netplay_client_id &&
+             raw_client_prepare_seq(seq)) {
+      serstate.aw.raw.reply[client_id] = words[client_id];
+      serstate.aw.raw.last_send[client_id] = words[client_id];
+      serstate.aw.raw.reply_mask |= (u8)(1 << client_id);
+      serstate.aw.raw.reply_recv_count++;
+      raw_trace(RAW_TRACE_REPLY_RX, seq, words, client_id);
+    }
+    else if (kind == RAW_KIND_BUS && netplay_client_id && client_id == 0) {
+      u32 i;
+      if (!serstate.aw.raw.transfer_pending && seq <= serstate.aw.raw.pending_seq) {
+        serstate.aw.raw.last_drop_seq = seq;
+        return;
+      }
+      for (i = 0; i <= 3; i++) {
+        serstate.aw.raw.bus[i] = words[i];
+        serstate.aw.raw.reply[i] = words[i];
+        serstate.aw.raw.last_send[i] = words[i];
+      }
+      serstate.aw.raw.reply_mask = raw_expected_mask();
+      serstate.aw.raw.pending_seq = seq;
+      serstate.aw.raw.irq_pending = 1;
+      serstate.aw.raw.transfer_pending = 0;
+      serstate.aw.raw.wait_cycles = raw_transfer_cycles();
+      serstate.aw.raw.request_pending = 0;
+      serstate.aw.raw.request_wait_cycles = 0;
+      serstate.aw.raw.bus_recv_count++;
+      raw_trace(RAW_TRACE_BUS_RX, seq, words, read_ioreg(REG_SIOMLT_SEND));
+    }
+    else if (kind == RAW_KIND_ACK && !netplay_client_id && client_id <= 3 &&
+             serstate.aw.raw.phase == RAW_PHASE_WAIT_ACKS &&
+             seq == serstate.aw.raw.pending_seq) {
+      serstate.aw.raw.ack_mask |= (u8)(1 << client_id);
+      serstate.aw.raw.ack_recv_count++;
+      raw_trace(RAW_TRACE_ACK_RX, seq, words, client_id);
+    }
+    else if (kind == RAW_KIND_REQ || kind == RAW_KIND_REPLY ||
+             kind == RAW_KIND_BUS || kind == RAW_KIND_ACK) {
+      serstate.aw.raw.last_drop_seq = seq;
+    }
+    return;
+  }
+
+  if (serstate.aw.raw.enabled)
+    return;
+
+  // MAW1 header, sanity checking.
   if (len >= 8 && netorder32(pkt[0]) == NET_SERADWR_HEADER) {
     const u32 flags = netorder32(pkt[1]);
     const u16 cmd = flags >> 16;
     const u16 ste = (flags >> 8) & 0xff;    // Peer state.
     const u16 cnt = flags & 0x00ff;         // Number of words to follow.
 
-    static int aw_recv_log_count = 0;
-    if (aw_recv_log_count++ < 30)
-      AW_TRACE("[AW-RECV] from=%d st=%d cmd=%04x cnt=%d myid=%d\n",
-               client_id, ste, cmd, cnt, netplay_client_id);
-
     serstate.aw.peer[client_id].timeout = 0;
-    serstate.aw.recv_count++;
-
     serstate.aw.peer[client_id].state = ste;
 
     SRPT_DEBUG_LOG("Got packet with state %d cmd %04x and size %d.\n", ste, cmd, cnt);
@@ -840,16 +1342,144 @@ void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id) {
           unpack16(&serstate.aw.peer[client_id].data[serstate.aw.peer[client_id].count], &pkt[2], cnt);
           serstate.aw.peer[client_id].count += cnt;
 
-          static int aw_data_recv_count = 0;
-          if (aw_data_recv_count++ < 20)
-            AW_TRACE("[AW-DATA-RX] from=%d cmd=%04x cnt=%d qlen=%d myid=%d\n",
-                     client_id, cmd, cnt, serstate.aw.peer[client_id].count, netplay_client_id);
+          SRPT_DEBUG_LOG("Received valid packet from client %d (with %d words)\n",
+                         client_id, cnt);
         }
-        else {
-          AW_TRACE("[AW-DROP] from=%d cnt=%d qlen=%d MAX=%d\n",
-                   client_id, cnt, serstate.aw.peer[client_id].count, MAX_FPACK);
-        }
+        else
+          SRPT_DEBUG_LOG("Packet dropped!\n");
       }
     }
   }
+}
+
+u32 serialaw_trace_value(int index) {
+  const u32 local = netplay_client_id & 3;
+  if (index >= 84) {
+    const u32 offset = (u32)(index - 84);
+    const u32 entry_offset = offset / 10;
+    const u32 field = offset % 10;
+    const u32 available = serstate.aw.raw.trace_count < RAW_TRACE_LEN ?
+      serstate.aw.raw.trace_count : RAW_TRACE_LEN;
+    u32 pos;
+
+    if (entry_offset >= available)
+      return 0;
+
+    pos = (serstate.aw.raw.trace_pos + RAW_TRACE_LEN - 1 - entry_offset) % RAW_TRACE_LEN;
+    switch (field) {
+    case 0: return serstate.aw.raw.trace[pos].event;
+    case 1: return serstate.aw.raw.trace[pos].seq;
+    case 2: return serstate.aw.raw.trace[pos].extra;
+    case 3: return serstate.aw.raw.trace[pos].words[0];
+    case 4: return serstate.aw.raw.trace[pos].words[1];
+    case 5: return serstate.aw.raw.trace[pos].words[2];
+    case 6: return serstate.aw.raw.trace[pos].words[3];
+    case 7: return serstate.aw.raw.trace[pos].siocnt;
+    case 8: return serstate.aw.raw.trace[pos].rcnt;
+    case 9: return serstate.aw.raw.trace[pos].flags;
+    default: return 0;
+    }
+  }
+
+  switch (index) {
+  case 0: return serstate.aw.peer[local].state;
+  case 1: return serstate.aw.peer[local].pstate;
+  case 2: return serstate.aw.peer[local].count;
+  case 3: return serstate.aw.peer[local].recvd;
+  case 4: return serstate.aw.peer[0].state;
+  case 5: return serstate.aw.peer[1].state;
+  case 6: return serstate.aw.peer[2].state;
+  case 7: return serstate.aw.peer[3].state;
+  case 8: return serstate.aw.peer[0].count;
+  case 9: return serstate.aw.peer[1].count;
+  case 10: return serstate.aw.peer[2].count;
+  case 11: return serstate.aw.peer[3].count;
+  case 12: return read_ioreg(REG_SIOMULTI0);
+  case 13: return read_ioreg(REG_SIOMULTI1);
+  case 14: return read_ioreg(REG_SIOMULTI2);
+  case 15: return read_ioreg(REG_SIOMULTI3);
+  case 16: return read_ioreg(REG_SIOCNT);
+  case 17: return serstate.aw.lastcmd;
+  case 18: return serstate.aw.peer[0].pstate;
+  case 19: return serstate.aw.peer[1].pstate;
+  case 20: return serstate.aw.peer[2].pstate;
+  case 21: return serstate.aw.peer[3].pstate;
+  case 22: return serstate.aw.peer[0].data[0];
+  case 23: return serstate.aw.peer[0].data[1];
+  case 24: return serstate.aw.peer[0].data[2];
+  case 25: return serstate.aw.peer[1].data[0];
+  case 26: return serstate.aw.peer[1].data[1];
+  case 27: return serstate.aw.peer[1].data[2];
+  case 28: return serstate.aw.peer[2].data[0];
+  case 29: return serstate.aw.peer[2].data[1];
+  case 30: return serstate.aw.peer[2].data[2];
+  case 31: return serstate.aw.peer[3].data[0];
+  case 32: return serstate.aw.peer[3].data[1];
+  case 33: return serstate.aw.peer[3].data[2];
+  case 34: return serstate.aw.peer[local].data[0];
+  case 35: return serstate.aw.peer[local].data[1];
+  case 36: return serstate.aw.peer[local].data[2];
+  case 37: return serstate.aw.peer[local].data[3];
+  case 38: return serstate.aw.peer[local].data[4];
+  case 39: return serstate.aw.peer[local].data[5];
+  case 40: return serstate.aw.peer[local].data[6];
+  case 41: return serstate.aw.peer[local].data[7];
+  case 42: return serstate.aw.peer[local].data[0] & 0xff;
+  case 43: return serstate.aw.raw.enabled;
+  case 44: return serstate.aw.raw.phase;
+  case 45: return serstate.aw.raw.reply_mask;
+  case 46: return serstate.aw.raw.ack_mask;
+  case 47: return serstate.aw.raw.irq_pending;
+  case 48: return serstate.aw.raw.seq;
+  case 49: return serstate.aw.raw.pending_seq;
+  case 50: return serstate.aw.raw.last_send[0];
+  case 51: return serstate.aw.raw.last_send[1];
+  case 52: return serstate.aw.raw.last_send[2];
+  case 53: return serstate.aw.raw.last_send[3];
+  case 54: return serstate.aw.raw.bus[0];
+  case 55: return serstate.aw.raw.bus[1];
+  case 56: return serstate.aw.raw.bus[2];
+  case 57: return serstate.aw.raw.bus[3];
+  case 58: return read_ioreg(REG_SIOMLT_SEND);
+  case 59: return serstate.aw.raw.pending_host_send;
+  case 60: return serstate.aw.raw.wait_cycles;
+  case 61: return serstate.aw.raw.pending_start;
+  case 62: return serstate.aw.raw.timeout_count;
+  case 63: return serstate.aw.raw.request_pending;
+  case 64: return serstate.aw.raw.request_seq;
+  case 65: return serstate.aw.raw.wait_send_write;
+  case 66: return serstate.aw.raw.request_wait_cycles;
+  case 67: return serstate.aw.raw.send_write_count;
+  case 68: return serstate.aw.raw.fresh_send_count;
+  case 69: return serstate.aw.raw.stale_reply_count;
+  case 70: return serstate.aw.raw.ack_send_count;
+  case 71: return serstate.aw.raw.ack_recv_count;
+  case 72: return serstate.aw.raw.reply_send_count;
+  case 73: return serstate.aw.raw.reply_recv_count;
+  case 74: return serstate.aw.raw.bus_recv_count;
+  case 75: return serstate.aw.raw.last_ack_send_seq;
+  case 76: return serstate.aw.raw.last_drop_seq;
+  case 77: return read_ioreg(REG_RCNT);
+  case 78: return serstate.aw.raw.transfer_pending;
+  case 79: return serstate.aw.raw.ack_pending;
+  case 80: return serstate.aw.raw.ack_ready;
+  case 81: return serstate.aw.raw.ack_wait_cycles;
+  case 82: return raw_transfer_cycles();
+  case 83: return serstate.aw.raw.fast_ack;
+  default: return 0;
+  }
+}
+
+void serialaw_set_raw_bus_enabled(int enabled) {
+  const u8 next_enabled = enabled ? 1 : 0;
+  if (serstate.aw.raw.enabled != next_enabled) {
+    const u8 fast_ack = serstate.aw.raw.fast_ack;
+    memset(&serstate.aw.raw, 0, sizeof(serstate.aw.raw));
+    serstate.aw.raw.enabled = next_enabled;
+    serstate.aw.raw.fast_ack = fast_ack;
+  }
+}
+
+void serialaw_set_raw_fast_ack_enabled(int enabled) {
+  serstate.aw.raw.fast_ack = enabled ? 1 : 0;
 }

@@ -52,10 +52,14 @@ void serialpoke_net_receive(const void* buf, size_t len, uint16_t client_id);
 
 void serialaw_frame_update(void);
 void serialaw_master_send(void);
+bool serialaw_raw_master_start(void);
+void serialaw_raw_send_write(u16 value);
+u32 serialaw_next_event(void);
 bool serialaw_update(unsigned cycles);
 void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id);
+u32 serialaw_trace_value(int index);
+void serialaw_set_raw_bus_enabled(int enabled);
+void serialaw_set_raw_fast_ack_enabled(int enabled);
 
 // GBP interface
 u32 gbp_transfer(u32 value);
-
-

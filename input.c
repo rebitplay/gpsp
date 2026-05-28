@@ -19,6 +19,17 @@
 
 #include "common.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+EM_JS(int, js_gpsp_input_mask, (), {
+   const source = (typeof Module !== 'undefined' && Module.__gpspInputMask) || globalThis.__gpspInputMask;
+   if (typeof source === 'function')
+      return source() | 0;
+   return source ? (source | 0) : 0;
+});
+#endif
+
 bool libretro_supports_bitmasks    = false;
 bool libretro_supports_ff_override = false;
 bool libretro_ff_enabled           = false;
@@ -30,6 +41,10 @@ unsigned turbo_a_counter   = 0;
 unsigned turbo_b_counter   = 0;
 
 static u32 old_key = 0;
+static u32 last_libretro_key = 0;
+static u32 last_js_key = 0;
+static u32 last_merged_key = 0;
+static u32 input_poll_count = 0;
 static retro_input_state_t input_state_cb;
 
 void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
@@ -70,10 +85,9 @@ u32 update_input(void)
    bool turbo_a     = false;
    bool turbo_b     = false;
 
-   if (!input_state_cb)
-      return 0;
+   input_poll_count++;
 
-   if (libretro_supports_bitmasks)
+   if (input_state_cb && libretro_supports_bitmasks)
    {
       int16_t ret = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
 
@@ -86,7 +100,7 @@ u32 update_input(void)
       turbo_a = (ret & (1 << RETRO_DEVICE_ID_JOYPAD_X));
       turbo_b = (ret & (1 << RETRO_DEVICE_ID_JOYPAD_Y));
    }
-   else
+   else if (input_state_cb)
    {
       for (i = 0; i < sizeof(btn_map) / sizeof(map); i++)
          new_key |= input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, btn_map[i].retropad) ? btn_map[i].gba : 0;
@@ -97,6 +111,15 @@ u32 update_input(void)
       turbo_a = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X);
       turbo_b = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y);
    }
+
+   last_libretro_key = new_key;
+#ifdef __EMSCRIPTEN__
+   last_js_key = ((u32)js_gpsp_input_mask()) & 0x3FF;
+   new_key |= last_js_key;
+#else
+   last_js_key = 0;
+#endif
+   last_merged_key = new_key;
 
    /* Handle turbo buttons */
    if (turbo_a)
@@ -148,6 +171,27 @@ u32 update_input(void)
    return 0;
 }
 
+u32 input_trace_value(int index)
+{
+   switch (index)
+   {
+   case 0:
+      return last_js_key;
+   case 1:
+      return last_libretro_key;
+   case 2:
+      return last_merged_key;
+   case 3:
+      return read_ioreg(REG_P1);
+   case 4:
+      return input_state_cb ? 1 : 0;
+   case 5:
+      return input_poll_count;
+   default:
+      return 0;
+   }
+}
+
 bool input_check_savestate(const u8 *src)
 {
   const u8 *p = bson_find_key(src, "input");
@@ -170,5 +214,3 @@ unsigned input_write_savestate(u8 *dst)
   bson_finish_document(dst, wbptr1);
   return (unsigned int)(dst - startp);
 }
-
-

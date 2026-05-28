@@ -1484,6 +1484,8 @@ void execute_arm(u32 cycles)
        u32 ret = update_gba(cycles_remaining);
        if (completed_frame(ret))
           return;
+       if (gpsp_bridge_step_once)
+          return;
 
        cycles_remaining = cycles_to_run(ret);
     }
@@ -3055,6 +3057,8 @@ skip_instruction:
     update_ret = update_gba(cycles_remaining);
     if (completed_frame(update_ret))
        return;
+    if (gpsp_bridge_step_once)
+       return;
     cycles_remaining = cycles_to_run(update_ret);
     continue;
 
@@ -3535,6 +3539,8 @@ thumb_loop:
     update_ret = update_gba(cycles_remaining);
     if (completed_frame(update_ret))
        return;
+    if (gpsp_bridge_step_once)
+       return;
     cycles_remaining = cycles_to_run(update_ret);
     continue;
 
@@ -3609,5 +3615,4 @@ unsigned cpu_write_savestate(u8 *dst)
   bson_finish_document(dst, wbptr);
   return (unsigned int)(dst - startp);
 }
-
 

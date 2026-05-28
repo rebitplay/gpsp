@@ -26,6 +26,7 @@ u32 frame_counter = 0;
 u32 cpu_ticks = 0;
 u32 execute_cycles = 0;
 s32 video_count = 0;
+u32 gpsp_bridge_step_once = 0;
 
 u32 last_frame = 0;
 u32 flush_ram_count = 0;
@@ -421,5 +422,4 @@ unsigned main_write_savestate(u8* dst)
 
   return (unsigned int)(dst - startp);
 }
-
 
